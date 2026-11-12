@@ -5,7 +5,7 @@ const SERVER_URL = (import.meta.env.VITE_SERVER_URL as string | undefined) ?? 'h
 
 export const socket: Socket<ServerToClientEvents, ClientToServerEvents> = io(SERVER_URL, {
   autoConnect: false,
-  transports: ['websocket'],
+  transports: ['polling', 'websocket'],
   reconnectionAttempts: Infinity,
   reconnectionDelay: 800,
   reconnectionDelayMax: 4000,

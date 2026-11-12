@@ -163,19 +163,18 @@ function AudioRoom({ talkora }: { talkora: TalkoraState }) {
     connected,
   } = talkora;
 
-  const localAudioRef = useRef<HTMLAudioElement>(null);
-  const consentGivenRef = useRef(false);
+  const remoteAudioRef = useRef<HTMLAudioElement>(null);
 
+  // Re-attempt autoplay whenever callState changes to 'connecting' or 'connected'
+  // (srcObject may have been assigned after the element mounted).
   useEffect(() => {
-    // Auto-play remote audio when a stream arrives.
-    const el = document.getElementById('remote-audio');
-    if (el instanceof HTMLAudioElement && el.srcObject) {
+    const el = remoteAudioRef.current;
+    if (el && el.srcObject) {
       el.play().catch(() => {});
     }
-  }, []);
+  }, [callState]);
 
   const handleEnableMic = async () => {
-    consentGivenRef.current = true;
     await enableMicrophone();
   };
 
@@ -228,7 +227,7 @@ function AudioRoom({ talkora }: { talkora: TalkoraState }) {
       </header>
 
       <section className="stage">
-        <audio id="remote-audio" autoPlay playsInline ref={localAudioRef} />
+        <audio id="remote-audio" autoPlay playsInline ref={remoteAudioRef} />
         <div className="stage__avatar">
           <span className={['stage__pulse', callState === 'connected' ? 'stage__pulse--live' : ''].join(' ')} />
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden>

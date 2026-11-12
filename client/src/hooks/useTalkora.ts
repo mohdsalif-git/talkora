@@ -19,25 +19,35 @@ export function useTalkora() {
   const screenRef = useRef<Screen>('home');
   screenRef.current = screen;
 
-  // WebRTC audio call state (Phase 3)
+  // WebRTC audio call state
   const webrtcRef = useRef<WebRtcAudio | null>(null);
   const [callState, setCallState] = useState<'idle' | 'connecting' | 'connected' | 'ended'>('idle');
   const [isMuted, setIsMuted] = useState(false);
   const [micPermission, setMicPermission] = useState<'not-asked' | 'granted' | 'denied'>('not-asked');
   const [iceConfig, setIceConfig] = useState<{ iceServers: RTCIceServer[]; hasTurn: boolean } | null>(null);
-  const signalingSentRef = useRef<Set<string>>(new Set()); // dedupe ICE candidate sends
+  const signalingSentRef = useRef<Set<string>>(new Set());
   const partnerBlockedRef = useRef(false);
   const pendingOffersRef = useRef<Map<string, { from: string; sdp: string }>>(new Map());
 
-  // Fetch ICE/turn config (metadata only, no credentials over the wire).
-  // Called at mount as an optimization, and again per audio call so rotated
-  // TURN credentials are picked up without reloading the page.
+  // Use refs to always have fresh values inside async callbacks / socket handlers
+  // without needing them as useEffect dependencies.
+  const micPermissionRef = useRef<'not-asked' | 'granted' | 'denied'>('not-asked');
+  const iceConfigRef = useRef<{ iceServers: RTCIceServer[]; hasTurn: boolean } | null>(null);
+  const currentMatchIdRef = useRef<string | null>(null);
+
+  // Keep refs in sync with state
+  micPermissionRef.current = micPermission;
+  iceConfigRef.current = iceConfig;
+
+  // Fetch ICE/turn config — called at mount and before every audio call.
   const fetchIceConfig = useCallback(async () => {
     try {
-      const r = await fetch('/api/ice-config');
+      const SERVER_URL = (import.meta.env.VITE_SERVER_URL as string | undefined) ?? 'http://localhost:4000';
+      const r = await fetch(`${SERVER_URL}/api/ice-config`);
       if (r.ok) {
         const cfg = await r.json();
         setIceConfig(cfg);
+        iceConfigRef.current = cfg;
       }
     } catch {
       /* ICE config optional — STUN default is used */
@@ -47,6 +57,52 @@ export function useTalkora() {
   useEffect(() => {
     fetchIceConfig();
   }, [fetchIceConfig]);
+
+  // Helper: get or create a WebRtcAudio instance for a given matchId.
+  // Always uses the latest iceConfig from the ref.
+  const ensureAudioForMatch = useCallback(async (matchId: string): Promise<WebRtcAudio> => {
+    await fetchIceConfig();
+    if (!webrtcRef.current || webrtcRef.current.boundMatchId !== matchId) {
+      webrtcRef.current?.dispose();
+      webrtcRef.current = new WebRtcAudio({
+        iceServers: iceConfigRef.current?.iceServers,
+        onStateChange: (state) => setCallState(state),
+        onRemoteStream: (stream) => {
+          const el = document.getElementById('remote-audio');
+          if (el instanceof HTMLAudioElement) {
+            el.srcObject = stream;
+            el.play().catch(() => {});
+          }
+        },
+      });
+      webrtcRef.current.boundMatchId = matchId;
+    }
+    return webrtcRef.current;
+  }, [fetchIceConfig]);
+
+  // Send all buffered ICE candidates and register an ongoing flush interval.
+  // Returns a cleanup function that stops the interval.
+  const startIceFlush = useCallback((matchId: string): (() => void) => {
+    const flush = () => {
+      const audio = webrtcRef.current;
+      if (!audio || audio.boundMatchId !== matchId) return;
+      audio.getIceCandidates().forEach((c) => {
+        const key = JSON.stringify(c);
+        if (!signalingSentRef.current.has(key)) {
+          signalingSentRef.current.add(key);
+          socket.emit('call:ice-candidate', { matchId, candidate: c });
+        }
+      });
+      audio.clearIceCandidates();
+    };
+    flush();
+    const timer = setInterval(flush, 500);
+    const stop = setTimeout(() => {
+      clearInterval(timer);
+      flush();
+    }, 6000);
+    return () => { clearInterval(timer); clearTimeout(stop); };
+  }, []);
 
   useEffect(() => {
     const onConnect = () => {
@@ -64,9 +120,17 @@ export function useTalkora() {
       setPartnerTyping(false);
       setScreen('matching');
       webrtcRef.current?.dispose();
+      webrtcRef.current = null;
       setCallState('idle');
       setIsMuted(false);
+      // Reset mic state so the button re-appears on the next audio match.
+      setMicPermission('not-asked');
+      micPermissionRef.current = 'not-asked';
+      currentMatchIdRef.current = null;
+      pendingOffersRef.current.clear();
+      signalingSentRef.current.clear();
     };
+
     const onMatchFound = async (payload: { matchId: string; mode: Mode }) => {
       await fetchIceConfig();
       chatModeRef.current = payload.mode;
@@ -77,18 +141,32 @@ export function useTalkora() {
       setScreen('chat');
       setCallState('idle');
       partnerBlockedRef.current = false;
-      // Audio matches need mic consent before establishing.
+      currentMatchIdRef.current = payload.matchId;
+      pendingOffersRef.current.clear();
+      signalingSentRef.current.clear();
+
       if (payload.mode === 'audio') {
-        webrtcRef.current = new WebRtcAudio({
-          iceServers: iceConfig?.iceServers,
+        // Always reset mic state on a new match so the Allow button is visible.
+        setMicPermission('not-asked');
+        micPermissionRef.current = 'not-asked';
+        // Pre-create the WebRtcAudio instance with its matchId bound,
+        // so enableMicrophone can find it immediately.
+        const audio = new WebRtcAudio({
+          iceServers: iceConfigRef.current?.iceServers,
           onStateChange: (state) => setCallState(state),
           onRemoteStream: (stream) => {
             const el = document.getElementById('remote-audio');
-            if (el instanceof HTMLAudioElement) el.srcObject = stream;
+            if (el instanceof HTMLAudioElement) {
+              el.srcObject = stream;
+              el.play().catch(() => {});
+            }
           },
         });
+        audio.boundMatchId = payload.matchId;
+        webrtcRef.current = audio;
       }
     };
+
     const onMatchEnded = (payload: { reason: string }) => {
       setPartnerTyping(false);
       setNotice(
@@ -97,11 +175,14 @@ export function useTalkora() {
           : 'Your partner left the chat.',
       );
       webrtcRef.current?.dispose();
+      webrtcRef.current = null;
       setCallState('idle');
       setIsMuted(false);
-      // Don't reset screen here — match:ended arrives before session:queued on requeue.
+      currentMatchIdRef.current = null;
     };
+
     const onCancelled = () => setNotice(null);
+
     const onChatMessage = (payload: { text: string; at: number }) => {
       setMessages((prev) => [
         ...prev,
@@ -114,30 +195,30 @@ export function useTalkora() {
     const onSystemError = (payload: { message: string }) => setNotice(payload.message);
 
     /* WebRTC signaling handlers */
+
+    // Answerer path: remote peer sent us an offer.
     const onCallOffer = async (payload: { from: string; sdp: string; matchId: string }) => {
+      // Buffer the offer — we might not have mic access yet.
       pendingOffersRef.current.set(payload.matchId, { from: payload.from, sdp: payload.sdp });
+
+      // If mic is already granted, answer immediately.
+      if (micPermissionRef.current !== 'granted') return;
+
       const audio = await ensureAudioForMatch(payload.matchId);
-      if (micPermission !== 'granted') {
-        // Waiting for explicit mic consent before answering.
-        return;
+      pendingOffersRef.current.delete(payload.matchId);
+      try {
+        const answer = await audio.handleOffer(payload.sdp);
+        socket.emit('call:answer', { matchId: payload.matchId, sdp: answer });
+        signalingSentRef.current.clear();
+        startIceFlush(payload.matchId);
+        setCallState('connecting');
+      } catch (err) {
+        console.error('WebRTC answer failed', err);
+        setNotice('Unable to start audio call. Text chat still works.');
       }
-      (async () => {
-        try {
-          const answer = await audio.handleOffer(payload.sdp);
-          socket.emit('call:answer', { matchId: payload.matchId, sdp: answer });
-          signalingSentRef.current.clear();
-          audio.getIceCandidates().forEach((c) => {
-            socket.emit('call:ice-candidate', { matchId: payload.matchId, candidate: c });
-          });
-          audio.clearIceCandidates();
-          setCallState('connecting');
-          pendingOffersRef.current.delete(payload.matchId);
-        } catch (err) {
-          console.error('WebRTC answer failed', err);
-          setNotice('Unable to start audio call. Text chat still works.');
-        }
-      })();
     };
+
+    // Offerer path: remote peer accepted our offer.
     const onCallAnswer = (payload: { from: string; sdp: string; matchId: string }) => {
       const audio = webrtcRef.current;
       if (!audio) return;
@@ -145,23 +226,27 @@ export function useTalkora() {
         try {
           await audio.handleAnswer(payload.sdp);
           signalingSentRef.current.clear();
-          audio.getIceCandidates().forEach((c) => {
-            socket.emit('call:ice-candidate', { matchId: payload.matchId, candidate: c });
-          });
-          audio.clearIceCandidates();
+          startIceFlush(payload.matchId);
           setCallState('connecting');
         } catch (err) {
           console.error('WebRTC answer apply failed', err);
         }
       })();
     };
-    const onCallIceCandidate = (payload: { from: string; candidate: RTCIceCandidateInit | null; matchId: string }) => {
+
+    const onCallIceCandidate = (payload: {
+      from: string;
+      candidate: RTCIceCandidateInit | null;
+      matchId: string;
+    }) => {
       const audio = webrtcRef.current;
       if (!audio) return;
       audio.addIceCandidate(payload.candidate);
     };
+
     const onCallEnded = (payload: { reason: string; matchId: string }) => {
       webrtcRef.current?.dispose();
+      webrtcRef.current = null;
       setCallState('idle');
       setIsMuted(false);
       setNotice(payload.reason === 'partner-ended' ? 'Call ended by your partner.' : 'Call ended.');
@@ -200,29 +285,13 @@ export function useTalkora() {
       socket.off('call:ice-candidate', onCallIceCandidate);
       socket.off('call:ended', onCallEnded);
     };
+    // Note: micPermission intentionally NOT in deps — handlers read micPermissionRef.current instead.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [gender, mode, micPermission]);
-
-  const ensureAudioForMatch = async (matchId: string): Promise<WebRtcAudio> => {
-    await fetchIceConfig();
-    if (!webrtcRef.current || webrtcRef.current.boundMatchId !== matchId) {
-      webrtcRef.current = new WebRtcAudio({
-        iceServers: iceConfig?.iceServers,
-        onStateChange: (state) => setCallState(state),
-        onRemoteStream: (stream) => {
-          const el = document.getElementById('remote-audio');
-          if (el instanceof HTMLAudioElement) el.srcObject = stream;
-        },
-      });
-      webrtcRef.current.boundMatchId = matchId;
-    }
-    return webrtcRef.current;
-  };
+  }, [gender, mode]);
 
   /* ------------------------------- actions ------------------------------- */
 
   const start = useCallback(() => setScreen('gender'), []);
-
   const backToHome = useCallback(() => setScreen('home'), []);
 
   const chooseGender = useCallback((g: Gender) => {
@@ -253,47 +322,65 @@ export function useTalkora() {
     setNotice(null);
     setScreen('home');
     webrtcRef.current?.dispose();
+    webrtcRef.current = null;
     setCallState('idle');
     setIsMuted(false);
+    setMicPermission('not-asked');
+    micPermissionRef.current = 'not-asked';
+    currentMatchIdRef.current = null;
+    pendingOffersRef.current.clear();
+    signalingSentRef.current.clear();
   }, []);
 
-  /** Explicit mic consent — user gesture triggers getUserMedia. */
+  /**
+   * Called when the user clicks "Allow microphone".
+   * 1. Requests mic access via getUserMedia (must be a user gesture).
+   * 2. If we have a pending offer → answer it (answerer path).
+   * 3. If no pending offer → send our own offer (offerer path).
+   */
   const enableMicrophone = useCallback(async () => {
-    if (micPermission === 'granted') return;
+    if (micPermissionRef.current === 'granted') return;
+
+    const matchId = currentMatchIdRef.current ?? webrtcRef.current?.boundMatchId;
+    if (!matchId) {
+      setNotice('Not in a match yet. Please wait for a partner.');
+      return;
+    }
+
     try {
-      const matchId = webrtcRef.current?.boundMatchId;
-      if (!matchId) return;
       const audio = await ensureAudioForMatch(matchId);
       await audio.requestMicrophone();
+
+      // Update both state and ref synchronously.
       setMicPermission('granted');
-      // Process any offer that arrived before mic consent.
-      const pending = matchId ? pendingOffersRef.current.get(matchId) : null;
+      micPermissionRef.current = 'granted';
+
+      const pending = pendingOffersRef.current.get(matchId);
+
       if (pending) {
+        // Answerer path: partner sent offer before we had mic access.
         pendingOffersRef.current.delete(matchId);
-        try {
-          const answer = await audio.handleOffer(pending.sdp);
-          socket.emit('call:answer', { matchId, sdp: answer });
-          signalingSentRef.current.clear();
-          const pendingMatchId = matchId!;
-          audio.getIceCandidates().forEach((c) => {
-            socket.emit('call:ice-candidate', { matchId: pendingMatchId, candidate: c });
-          });
-          audio.clearIceCandidates();
-          setCallState('connecting');
-        } catch (err) {
-          console.error('WebRTC answer failed', err);
-          setNotice('Unable to start audio call. Text chat still works.');
-        }
-      } else if (screen === 'chat' && chatModeRef.current === 'audio') {
+        const answer = await audio.handleOffer(pending.sdp);
+        socket.emit('call:answer', { matchId, sdp: answer });
+        signalingSentRef.current.clear();
+        startIceFlush(matchId);
         setCallState('connecting');
+      } else {
+        // Offerer path: we got mic first, now initiate the call.
+        setCallState('connecting');
+        const sdp = await audio.prepareOffer();
+        socket.emit('call:offer', { matchId, sdp });
+        signalingSentRef.current.clear();
+        startIceFlush(matchId);
       }
     } catch (err) {
       setMicPermission('denied');
+      micPermissionRef.current = 'denied';
       setNotice(
         err instanceof Error ? `Microphone access denied: ${err.message}` : 'Microphone access denied.',
       );
     }
-  }, [micPermission, callState, screen]);
+  }, [ensureAudioForMatch, startIceFlush]);
 
   const toggleMute = useCallback(() => {
     webrtcRef.current?.setMuted(!isMuted);
@@ -319,42 +406,28 @@ export function useTalkora() {
     socket.emit('block');
   }, []);
 
-  /** Offerer side: create and send the WebRTC offer, then stream ICE candidates. */
+  /**
+   * @deprecated – mic permission now handles initiating the offer automatically.
+   * Kept for compatibility in case it is called from outside.
+   */
   const initiateAudioCall = useCallback(async (matchId: string) => {
-    const audio = await ensureAudioForMatch(matchId);
-    webrtcRef.current = audio;
-    if (micPermission !== 'granted') {
-      setNotice('Please allow microphone access to start an audio call.');
+    if (micPermissionRef.current !== 'granted') {
+      setNotice('Please allow microphone access first.');
       return;
     }
     try {
+      const audio = await ensureAudioForMatch(matchId);
       setCallState('connecting');
       const sdp = await audio.prepareOffer();
       socket.emit('call:offer', { matchId, sdp });
-      // Send ICE candidates as they gather (and any late ones).
-      const sendCandidates = () => {
-        const cands = audio.getIceCandidates();
-        cands.forEach((c) => {
-          const key = JSON.stringify(c);
-          if (!signalingSentRef.current.has(key)) {
-            signalingSentRef.current.add(key);
-            socket.emit('call:ice-candidate', { matchId, candidate: c });
-          }
-        });
-        audio.clearIceCandidates();
-      };
-      // Poll briefly for gathering completion; clients also send on icegatheringstatechange via WebRtcAudio.
-      const timer = setInterval(sendCandidates, 500);
-      setTimeout(() => {
-        clearInterval(timer);
-        sendCandidates();
-      }, 5000);
+      signalingSentRef.current.clear();
+      startIceFlush(matchId);
     } catch (err) {
       console.error('WebRTC offer failed', err);
       setCallState('idle');
       setNotice('Unable to start audio call. Text chat still works.');
     }
-  }, [micPermission]);
+  }, [ensureAudioForMatch, startIceFlush]);
 
   return {
     screen,

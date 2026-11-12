@@ -16,6 +16,8 @@ export class WebRtcAudio {
   private remoteCandidates: RTCIceCandidate[] = [];
   private matchId: string | null = null;
   private iceServers: RTCIceServer[];
+  /** Optional callback: fired when ICE gathering is complete so callers can flush immediately. */
+  onIceGatheringComplete?: () => void;
 
   constructor(opts: {
     iceServers?: RTCIceServer[];
@@ -76,6 +78,10 @@ export class WebRtcAudio {
     this.pc.onicecandidate = (event) => {
       if (event.candidate) this.iceCandidates.push(event.candidate);
     };
+    this.pc.onicegatheringstatechange = () => {
+      // Notify the hook to flush new candidates immediately.
+      if (this.pc?.iceGatheringState === 'complete') this.onIceGatheringComplete?.();
+    };
     this.pc.onconnectionstatechange = () => this.handleConnectionState();
     this.pc.ontrack = (event) => {
       this.remoteStream = event.streams[0];
@@ -93,6 +99,9 @@ export class WebRtcAudio {
     this.pc = this.createPeerConnection();
     this.pc.onicecandidate = (event) => {
       if (event.candidate) this.iceCandidates.push(event.candidate);
+    };
+    this.pc.onicegatheringstatechange = () => {
+      if (this.pc?.iceGatheringState === 'complete') this.onIceGatheringComplete?.();
     };
     this.pc.onconnectionstatechange = () => this.handleConnectionState();
     this.pc.ontrack = (event) => {

@@ -2,12 +2,17 @@ import 'dotenv/config';
 import http from 'node:http';
 import express from 'express';
 import cors from 'cors';
+import dns from 'dns';
 import mongoose from 'mongoose';
 import { attachRealtime } from './socket/index.js';
 import { getCounters } from './config/counters.js';
 import reportRouter from './routes/report.js';
 import { ICE_SERVERS, hasTurn } from './config/iceServers.js';
-
+try {
+  dns.setServers(["1.1.1.1", "8.8.8.8"]);
+} catch {
+  // Ignore in environments where setting custom DNS servers is restricted
+}
 const PORT = Number(process.env.PORT) || 4000;
 const CLIENT_ORIGINS = (process.env.CLIENT_ORIGIN || 'http://localhost:5173,http://127.0.0.1:5173')
   .split(',')
