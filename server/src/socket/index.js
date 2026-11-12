@@ -121,14 +121,14 @@ export function attachRealtime(httpServer, allowedOrigins) {
         socket.emit('system:error', { message: 'Invalid call offer.' });
         return;
       }
-      if (!calls.isAuthorized(socket.id, matchId)) {
+      const partner = engine.partnerOf(socket.id);
+      if (!partner || partner.match.id !== matchId) {
         socket.emit('system:error', { message: 'Not authorized for this call.' });
         logSocket(socket, 'call:offer', { error: 'unauthorized', matchId });
         return;
       }
-      calls.startCall(matchId, [socket.id, engine.partnerOf(socket.id)?.session.socketId ?? null], socket.id);
-      const partnerId = engine.partnerOf(socket.id)?.session.socketId;
-      if (!partnerId) return;
+      calls.startCall(matchId, [socket.id, partner.session.socketId], socket.id);
+      const partnerId = partner.session.socketId;
       logSocket(socket, 'call:offer', { matchId, to: partnerId.slice(0, 6) });
       io.to(partnerId).emit('call:offer', { from: socket.id, sdp, matchId });
     });
@@ -143,13 +143,13 @@ export function attachRealtime(httpServer, allowedOrigins) {
         socket.emit('system:error', { message: 'Invalid call answer.' });
         return;
       }
-      if (!calls.isAuthorized(socket.id, matchId)) {
+      const partner = engine.partnerOf(socket.id);
+      if (!partner || partner.match.id !== matchId) {
         socket.emit('system:error', { message: 'Not authorized for this call.' });
         return;
       }
       calls.setAnswered(matchId);
-      const partnerId = engine.partnerOf(socket.id)?.session.socketId;
-      if (!partnerId) return;
+      const partnerId = partner.session.socketId;
       logSocket(socket, 'call:answer', { matchId, to: partnerId.slice(0, 6) });
       io.to(partnerId).emit('call:answer', { from: socket.id, sdp, matchId });
     });
@@ -164,26 +164,28 @@ export function attachRealtime(httpServer, allowedOrigins) {
         socket.emit('system:error', { message: 'Invalid ICE candidate.' });
         return;
       }
-      if (!calls.isAuthorized(socket.id, matchId)) {
+      const partner = engine.partnerOf(socket.id);
+      if (!partner || partner.match.id !== matchId) {
         socket.emit('system:error', { message: 'Not authorized for this call.' });
         return;
       }
-      const partnerId = engine.partnerOf(socket.id)?.session.socketId;
-      if (!partnerId) return;
+      const partnerId = partner.session.socketId;
       io.to(partnerId).emit('call:ice-candidate', { from: socket.id, candidate, matchId });
     });
 
     socket.on('call:active', (payload) => {
       const { matchId } = payload ?? {};
-      if (!matchId || !calls.isAuthorized(socket.id, matchId)) return;
+      const partner = engine.partnerOf(socket.id);
+      if (!matchId || !partner || partner.match.id !== matchId) return;
       calls.setActive(matchId);
       logSocket(socket, 'call:active', { matchId });
     });
 
     socket.on('call:end', (payload) => {
       const { matchId } = payload ?? {};
-      if (!matchId || !calls.isAuthorized(socket.id, matchId)) return;
-      const partnerId = engine.partnerOf(socket.id)?.session.socketId;
+      const partner = engine.partnerOf(socket.id);
+      if (!matchId || !partner || partner.match.id !== matchId) return;
+      const partnerId = partner.session.socketId;
       calls.endCall(matchId);
       if (partnerId) io.to(partnerId).emit('call:ended', { reason: 'partner-ended', matchId });
       logSocket(socket, 'call:end', { matchId });
