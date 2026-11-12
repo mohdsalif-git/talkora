@@ -1,0 +1,26 @@
+{
+  "name": "talkora",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Talkora — random 1-on-1 text and audio conversations with strangers",
+  "workspaces": [
+    "client",
+    "server"
+  ],
+  "type": "module",
+  "scripts": {
+    "install:all": "npm install",
+    "postinstall": "node scripts/patch-rollup-wasm.js",
+    "dev": "concurrently -n server,client -c magenta,cyan \"npm run dev -w server\" \"npm run dev -w client\"",
+    "dev:server": "npm run dev -w server",
+    "dev:client": "npm run dev -w client",
+    "build": "npm run build -w client"
+  },
+  "devDependencies": {
+    "@rollup/wasm-node": "^4.68.2",
+    "concurrently": "^9.1.2"
+  },
+  "allowScripts": {
+    "esbuild@0.25.12": true
+  }
+}
